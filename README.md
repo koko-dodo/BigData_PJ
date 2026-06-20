@@ -40,25 +40,25 @@ GitHub / Gitee 保存一份
 整体版本设计如下：
 
 ```text
-V1：IQR Baseline
-        ↓ 解决：先建立可解释的无监督基线
-V2：IQR + Z-score
-        ↓ 解决：IQR 对部分偏离均值的异常不敏感
-V3：按 object_id + kpi_name 分组检测
-        ↓ 解决：不同服务、不同指标分布差异很大
-V4：滑动窗口 IQR / Z-score
-        ↓ 解决：全局统计忽略时间序列的动态变化
-V5：多指标融合 / Isolation Forest
+V1：分组 IQR Baseline
+        ↓ 解决：建立可解释的无监督基线，同时避免不同对象、不同指标混在一起计算阈值
+V2：分组 IQR + Z-score
+        ↓ 解决：单一 IQR 对部分偏离均值的异常不敏感
+V3：滑动窗口 Z-score
+        ↓ 解决：全量静态统计忽略时间序列的动态变化
+V4：多指标融合 / Isolation Forest
         ↓ 解决：单指标检测无法刻画多指标共同异常
 ```
 
+说明：最初方案中曾单独规划“按 `object_id + kpi_name` 分组检测”作为 V3。但在实际实现 IQR Baseline 时，已经直接按 `object_id + kpi_name + metric_type` 计算每条指标序列的独立阈值，因此分组检测已经前置合并到 V1 和 V2 中，不再作为单独版本重复实现。
+
 ---
 
-## 2. V1：IQR Baseline
+## 2. V1：分组 IQR Baseline
 
 ### 2.1 为什么先做 IQR
 
-第一版选择 IQR 作为 baseline，主要原因是：
+第一版选择 IQR 作为 baseline，并在实现时直接采用分组检测，主要原因是：
 
 1. **不需要标签**  
    运维异常检测中，很多数据没有明确的人工标注，因此适合先使用无监督方法。
@@ -69,9 +69,18 @@ V5：多指标融合 / Isolation Forest
 3. **适合大规模数据处理**  
    IQR 只需要计算分位数和阈值，可以用 Spark 在大规模数据上完成。
 
+4. **不同指标不能共用同一个阈值**  
+   AIOps 数据中不同 `object_id` 和 `kpi_name` 的取值范围差异很大，因此 baseline 阶段就按 `object_id + kpi_name + metric_type` 分组，为每条指标序列建立自己的正常范围。
+
 ### 2.2 IQR 算法原理
 
-对某个指标的所有取值计算：
+对每条指标序列：
+
+```text
+object_id + kpi_name + metric_type
+```
+
+分别计算：
 
 ```text
 Q1 = 25% 分位数
@@ -96,25 +105,31 @@ value < lower_bound 或 value > upper_bound
 
 ### 2.3 具体操作
 
-第一版可以先对全体数据或者每个 `kpi_name` 计算 IQR 阈值：
+第一版实际实现时没有使用全局阈值，而是按 `object_id + kpi_name + metric_type` 分组计算 IQR 阈值：
 
 ```scala
-val quantiles = df.stat.approxQuantile("value", Array(0.25, 0.75), 0.01)
-
-val q1 = quantiles(0)
-val q3 = quantiles(1)
-val iqr = q3 - q1
-
-val lower = q1 - 1.5 * iqr
-val upper = q3 + 1.5 * iqr
-
-val result = df.withColumn(
-  "is_anomaly_iqr",
-  $"value" < lower || $"value" > upper
-)
+val stats = df
+  .groupBy("object_id", "kpi_name", "metric_type")
+  .agg(
+    expr("percentile_approx(value, 0.25, 300)").alias("q1"),
+    expr("percentile_approx(value, 0.75, 300)").alias("q3"),
+    count("*").alias("point_count")
+  )
+  .withColumn("iqr", col("q3") - col("q1"))
+  .withColumn("lower_bound", col("q1") - lit(1.5) * col("iqr"))
+  .withColumn("upper_bound", col("q3") + lit(1.5) * col("iqr"))
 ```
 
-如果按指标分组，可以对每个 `kpi_name` 分别计算阈值，再 join 回原始数据。
+再把统计量 join 回原始数据，筛选超出上下界的异常点：
+
+```scala
+val anomalies = df
+  .join(stats, Seq("object_id", "kpi_name", "metric_type"), "inner")
+  .filter(
+    col("iqr") =!= 0.0 &&
+    (col("value") < col("lower_bound") || col("value") > col("upper_bound"))
+  )
+```
 
 ### 2.4 本版本输出
 
@@ -126,12 +141,18 @@ object_id
 kpi_name
 metric_type
 value
-is_anomaly_iqr
+q1
+q3
+iqr
+lower_bound
+upper_bound
 ```
+
+说明：V1 的 `anomaly_points` 目录只保存已经被 IQR 判定为异常的点，因此结果中不再额外保存 `is_anomaly_iqr` 布尔字段；如果需要在报告中表达，可以把这些输出点统一视为 `is_anomaly_iqr = true`。
 
 ---
 
-## 3. V2：IQR + Z-score
+## 3. V2：分组 IQR + Z-score
 
 ### 3.1 为什么从 V1 升级到 V2
 
@@ -143,7 +164,13 @@ IQR 虽然简单，但它主要关注数据是否超出四分位范围。实际�
 2. **单一统计标准不够稳定**  
    IQR 只看分位数，不直接考虑均值和标准差，因此可以引入另一种统计视角。
 
-因此第二版加入 Z-score，形成“双统计规则”。
+因此第二版在 V1 的分组 IQR 基础上加入 Z-score，形成“双统计规则”。统计粒度仍然保持：
+
+```text
+object_id + kpi_name + metric_type
+```
+
+这样 IQR 和 Z-score 都是在同一条指标序列内部计算，而不是把不同对象、不同指标混在一起比较。
 
 ### 3.2 Z-score 算法原理
 
@@ -163,28 +190,44 @@ z = (value - mean) / stddev
 
 ### 3.3 具体操作
 
-先计算均值和标准差：
+先按 `object_id + kpi_name + metric_type` 分组，同时计算 IQR 所需分位数，以及 Z-score 所需均值和标准差：
 
 ```scala
-val stats = df.agg(
-  avg("value").as("mean_value"),
-  stddev("value").as("std_value")
-).collect()(0)
-
-val meanValue = stats.getAs[Double]("mean_value")
-val stdValue = stats.getAs[Double]("std_value")
+val stats = df
+  .groupBy("object_id", "kpi_name", "metric_type")
+  .agg(
+    expr("percentile_approx(value, 0.25, 300)").alias("q1"),
+    expr("percentile_approx(value, 0.75, 300)").alias("q3"),
+    avg("value").alias("mean_value"),
+    stddev("value").alias("std_value"),
+    count("*").alias("point_count")
+  )
+  .withColumn("iqr", col("q3") - col("q1"))
+  .withColumn("lower_bound", col("q1") - lit(1.5) * col("iqr"))
+  .withColumn("upper_bound", col("q3") + lit(1.5) * col("iqr"))
 ```
 
-然后计算 Z-score：
+然后 join 回原始数据，分别计算 IQR 异常、Z-score 异常：
 
 ```scala
-val result = df.withColumn(
-  "z_score",
-  ($"value" - meanValue) / stdValue
-).withColumn(
-  "is_anomaly_zscore",
-  abs($"z_score") > 3
-)
+val result = df
+  .join(stats, Seq("object_id", "kpi_name", "metric_type"), "inner")
+  .withColumn(
+    "is_anomaly_iqr",
+    col("iqr") =!= 0.0 &&
+      (col("value") < col("lower_bound") || col("value") > col("upper_bound"))
+  )
+  .withColumn(
+    "z_score",
+    when(
+      col("std_value").isNotNull && col("std_value") =!= 0.0,
+      (col("value") - col("mean_value")) / col("std_value")
+    )
+  )
+  .withColumn(
+    "is_anomaly_zscore",
+    abs(col("z_score")) > 3
+  )
 ```
 
 最终异常可以有两种设计：
@@ -217,6 +260,14 @@ object_id
 kpi_name
 metric_type
 value
+q1
+q3
+iqr
+lower_bound
+upper_bound
+mean_value
+std_value
+z_score
 is_anomaly_iqr
 is_anomaly_zscore
 is_anomaly_final
@@ -224,11 +275,15 @@ is_anomaly_final
 
 ---
 
-## 4. V3：按 object_id + kpi_name 分组检测
+## 4. 分组检测已前置到 V1 / V2
 
-### 4.1 为什么从 V2 升级到 V3
+### 4.1 为什么不再单独实现“分组检测版本”
 
-V2 仍然存在一个核心问题：不同对象、不同指标的数据分布差异很大。
+最初方案中曾计划把“按 `object_id + kpi_name` 分组检测”作为 V3。但在实际完成 IQR Baseline 时，已经发现全局阈值不适合当前 AIOps 数据，因此 V1 直接采用了分组 IQR。
+
+换句话说，分组检测不是被取消了，而是被提前合并到了 baseline 中。
+
+这样做的原因是：不同对象、不同指标的数据分布差异很大。
 
 例如：
 
@@ -246,14 +301,14 @@ V2 仍然存在一个核心问题：不同对象、不同指标的数据分布�
 
 同样，不同 `kpi_name` 的量纲也完全不同，例如请求数、延迟、内存、JVM 指标不能直接放在同一个统计分布里比较。
 
-因此第三版需要从“全局检测”升级为“分组检测”。
+因此如果 V1 先做全局 IQR，再单独做一个分组版本，虽然版本递进更明显，但实际 baseline 的质量较弱。当前实现选择在第一版就避免这个问题，让后续 V2、V3 都建立在更合理的分组统计基础上。
 
-### 4.2 分组逻辑
+### 4.2 当前实际分组逻辑
 
-建议按照：
+当前 V1 和 V2 都按照：
 
 ```text
-object_id + kpi_name
+object_id + kpi_name + metric_type
 ```
 
 进行分组。
@@ -264,46 +319,36 @@ object_id + kpi_name
 
 这样每条时间序列都有自己的统计阈值。
 
-### 4.3 具体操作
+### 4.3 当前代码体现
 
-先按 `object_id` 和 `kpi_name` 分组计算统计量：
+V1 中已经按分组计算 IQR 阈值：
 
 ```scala
-val stats = df.groupBy("object_id", "kpi_name")
+val stats = df
+  .groupBy("object_id", "kpi_name", "metric_type")
   .agg(
-    expr("percentile_approx(value, 0.25)").as("q1"),
-    expr("percentile_approx(value, 0.75)").as("q3"),
-    avg("value").as("mean_value"),
-    stddev("value").as("std_value")
+    expr("percentile_approx(value, 0.25, 300)").alias("q1"),
+    expr("percentile_approx(value, 0.75, 300)").alias("q3"),
+    count("*").alias("point_count")
   )
-  .withColumn("iqr", $"q3" - $"q1")
-  .withColumn("lower_bound", $"q1" - lit(1.5) * $"iqr")
-  .withColumn("upper_bound", $"q3" + lit(1.5) * $"iqr")
 ```
 
-再把统计量 join 回原始数据：
+V2 继续沿用同样分组，并额外计算均值和标准差：
 
 ```scala
-val result = df.join(stats, Seq("object_id", "kpi_name"))
-  .withColumn(
-    "is_anomaly_iqr",
-    $"value" < $"lower_bound" || $"value" > $"upper_bound"
-  )
-  .withColumn(
-    "z_score",
-    when($"std_value".isNotNull && $"std_value" =!= 0,
-      ($"value" - $"mean_value") / $"std_value"
-    )
-  )
-  .withColumn(
-    "is_anomaly_zscore",
-    abs($"z_score") > 3
+val stats = df
+  .groupBy("object_id", "kpi_name", "metric_type")
+  .agg(
+    expr("percentile_approx(value, 0.25, 300)").alias("q1"),
+    expr("percentile_approx(value, 0.75, 300)").alias("q3"),
+    avg("value").alias("mean_value"),
+    stddev("value").alias("std_value")
   )
 ```
 
-### 4.4 本版本优化点
+### 4.4 对版本路线的影响
 
-V3 相比 V2 的核心提升是：
+原计划中的 V3 核心提升是：
 
 ```text
 全局阈值
@@ -311,15 +356,15 @@ V3 相比 V2 的核心提升是：
 每条指标序列自己的阈值
 ```
 
-这一步在逻辑上非常重要，因为它更符合 AIOps 数据的实际特点。
+这一步仍然非常重要，只是已经在 V1 中完成。因此后续真正需要继续实现的下一步，不是重复分组检测，而是滑动窗口方法。
 
 ---
 
-## 5. V4：滑动窗口 IQR / Z-score
+## 5. V3：滑动窗口 Z-score
 
-### 5.1 为什么从 V3 升级到 V4
+### 5.1 为什么从 V2 升级到 V3
 
-V3 虽然已经按对象和指标分组，但仍然使用全量历史数据计算统计量。这会忽略时间序列中的动态变化。
+V1 和 V2 虽然已经按对象和指标分组，但仍然使用全量历史数据计算统计量。这会忽略时间序列中的动态变化。
 
 在运维监控数据中，同一个指标在不同时间段可能有不同的正常水平。例如：
 
@@ -329,14 +374,14 @@ V3 虽然已经按对象和指标分组，但仍然使用全量历史数据计�
 系统发布后指标基线可能整体变化
 ```
 
-如果仍然使用全局统计量，就可能出现：
+如果仍然使用全量静态统计量，就可能出现：
 
 ```text
 白天正常高峰被误报
 凌晨异常升高被漏报
 ```
 
-因此第四版引入滑动窗口，让阈值随时间动态变化。
+因此第三版引入滑动窗口，让阈值随时间动态变化。
 
 ### 5.2 滑动窗口思想
 
@@ -387,7 +432,7 @@ val result = df
 
 ### 5.4 本版本优化点
 
-V4 相比 V3 的核心提升是：
+V3 相比 V2 的核心提升是：
 
 ```text
 静态阈值
@@ -399,9 +444,9 @@ V4 相比 V3 的核心提升是：
 
 ---
 
-## 6. V5：多指标融合 / Isolation Forest
+## 6. V4：多指标融合 / Isolation Forest
 
-### 6.1 为什么从 V4 升级到 V5
+### 6.1 为什么从 V3 升级到 V4
 
 前面几个版本主要是单指标检测，也就是说每次只看一个 `value` 是否异常。
 
@@ -416,7 +461,7 @@ CPU 升高
 
 如果只看单个指标，可能每个指标都只是“略微异常”；但如果它们同时发生，就很可能代表系统出现问题。
 
-因此第五版从“单指标异常”升级到“多指标联合异常”。
+因此第四版从“单指标异常”升级到“多指标联合异常”。
 
 ### 6.2 Isolation Forest 思想
 
@@ -499,11 +544,11 @@ anomaly_score
 prediction
 ```
 
-如果当前环境没有现成 Isolation Forest 包，也可以把 V5 作为扩展方案写入报告，不一定必须完全实现。课程项目中，V1 到 V4 已经形成了完整递进逻辑；V5 可以作为高级优化方向。
+如果当前环境没有现成 Isolation Forest 包，也可以把 V4 作为扩展方案写入报告，不一定必须完全实现。课程项目中，V1 到 V3 已经形成了完整递进逻辑；V4 可以作为高级优化方向。
 
 ### 6.5 本版本优化点
 
-V5 相比 V4 的核心提升是：
+V4 相比 V3 的核心提升是：
 
 ```text
 单指标检测
@@ -520,13 +565,12 @@ V5 相比 V4 的核心提升是：
 考虑课程项目时间和实现成本，建议最终实际完成：
 
 ```text
-V1：IQR Baseline
-V2：IQR + Z-score
-V3：按 object_id + kpi_name 分组检测
-V4：滑动窗口 Z-score
+V1：分组 IQR Baseline
+V2：分组 IQR + Z-score
+V3：滑动窗口 Z-score
 ```
 
-V5 可以作为报告中的进一步优化方向。
+V4 多指标融合 / Isolation Forest 可以作为报告中的进一步优化方向。
 
 这样安排的好处是：
 
@@ -540,7 +584,7 @@ V5 可以作为报告中的进一步优化方向。
 
 ## 8. 答辩时可以使用的总述
 
-本项目的算法设计采用逐步迭代的方式。首先，我们使用 IQR 方法作为 baseline，因为它不依赖标签，适合无监督异常检测，并且具有较好的可解释性。随后，我们发现单独使用 IQR 对部分偏离均值的异常不够敏感，因此加入 Z-score，从分位数和均值标准差两个角度共同判断异常。接着，考虑到不同对象和不同指标之间的数值分布差异较大，我们将全局检测优化为按照 `object_id + kpi_name` 分组检测，使每条指标序列拥有独立阈值。进一步地，考虑到监控数据具有明显的时间序列特征，我们引入滑动窗口方法，使阈值能够根据局部时间范围动态变化。最后，针对单指标检测难以发现多指标共同异常的问题，我们将 Isolation Forest 作为进一步优化方向，用于多维特征下的无监督异常检测。
+本项目的算法设计采用逐步迭代的方式。首先，我们使用 IQR 方法作为 baseline，因为它不依赖标签，适合无监督异常检测，并且具有较好的可解释性。考虑到不同对象和不同指标之间的数值分布差异很大，我们在 baseline 阶段就没有使用全局阈值，而是按照 `object_id + kpi_name + metric_type` 分组检测，使每条指标序列拥有独立阈值。随后，我们发现单独使用 IQR 对部分偏离均值的异常不够敏感，因此加入 Z-score，从分位数和均值标准差两个角度共同判断异常。进一步地，考虑到监控数据具有明显的时间序列特征，我们引入滑动窗口方法，使阈值能够根据局部时间范围动态变化。最后，针对单指标检测难以发现多指标共同异常的问题，我们将 Isolation Forest 作为进一步优化方向，用于多维特征下的无监督异常检测。
 
 ---
 
@@ -548,11 +592,10 @@ V5 可以作为报告中的进一步优化方向。
 
 | 版本 | 方法 | 解决的问题 | 主要操作 | 是否建议实现 |
 |---|---|---|---|---|
-| V1 | IQR | 建立无监督 baseline | 计算 Q1、Q3、IQR、上下界 | 必须实现 |
-| V2 | IQR + Z-score | 单一 IQR 可能漏检 | 加入均值、标准差、Z-score | 必须实现 |
-| V3 | 分组 IQR / Z-score | 不同对象和指标分布不同 | 按 object_id + kpi_name 分组 | 强烈建议实现 |
-| V4 | 滑动窗口 Z-score | 全局阈值忽略时间变化 | 按时间窗口计算动态均值和标准差 | 建议实现 |
-| V5 | Isolation Forest | 单指标无法发现多指标联合异常 | pivot 成宽表，构造多维特征 | 可作为扩展 |
+| V1 | 分组 IQR Baseline | 建立无监督 baseline，同时避免不同序列共用阈值 | 按 object_id + kpi_name + metric_type 计算 Q1、Q3、IQR、上下界 | 已完成 |
+| V2 | 分组 IQR + Z-score | 单一 IQR 可能漏检 | 在同一分组粒度下加入均值、标准差、Z-score | 必须实现 |
+| V3 | 滑动窗口 Z-score | 全量静态阈值忽略时间变化 | 按时间窗口计算动态均值和标准差 | 建议实现 |
+| V4 | Isolation Forest | 单指标无法发现多指标联合异常 | pivot 成宽表，构造多维特征 | 可作为扩展 |
 
 ---
 
@@ -562,10 +605,9 @@ V5 可以作为报告中的进一步优化方向。
 
 ```text
 我们先用 IQR 建立 baseline；
-发现 IQR 存在漏检和静态阈值问题；
+baseline 阶段已经按 object_id + kpi_name + metric_type 分组，避免不同序列共用阈值；
+发现单独使用 IQR 存在漏检和静态阈值问题；
 因此加入 Z-score；
-进一步发现不同对象和指标不能共用一个阈值；
-因此进行分组检测；
 最后考虑时间序列动态变化；
 因此引入滑动窗口方法。
 ```
