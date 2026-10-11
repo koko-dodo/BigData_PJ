@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="480" viewBox="0 0 960 480" role="img">
+<title>Historical detection counts</title>
+<rect width="960" height="480" rx="16" fill="#f8fafc"/>
+<g font-family="Arial, sans-serif" fill="#0f172a">
+<text x="40" y="48" font-size="26" font-weight="bold">Historical detection counts</text>
+<text x="40" y="80" font-size="15" fill="#475569">V1–V3: single-KPI points; V4: object-time events (different unit)</text>
+<text x="40" y="138" font-size="16">V1 IQR</text>
+<rect x="220" y="115" width="530.00" height="32" rx="4" fill="#2563eb"/>
+<text x="765.00" y="138" font-size="16">574,873</text>
+<text x="40" y="191" font-size="16">V2 IQR + Z</text>
+<rect x="220" y="168" width="119.14" height="32" rx="4" fill="#0891b2"/>
+<text x="354.14" y="191" font-size="16">129,228</text>
+<text x="40" y="244" font-size="16">V3 Window Z</text>
+<rect x="220" y="221" width="206.99" height="32" rx="4" fill="#7c3aed"/>
+<text x="441.99" y="244" font-size="16">224,512</text>
+<text x="40" y="297" font-size="16">V4 Fusion events</text>
+<rect x="220" y="274" width="68.19" height="32" rx="4" fill="#d97706"/>
+<text x="303.19" y="297" font-size="16">73,958</text>
+<text x="40" y="410" font-size="14" fill="#475569">V2 flags 77.52% fewer points than V1. This is not a false-positive reduction metric.</text>
+<text x="40" y="435" font-size="14" fill="#475569">Source: course experiment report; counts were not recomputed in this cleanup.</text>
+</g></svg>

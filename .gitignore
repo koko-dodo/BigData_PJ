@@ -1,0 +1,17 @@
+.DS_Store
+._*
+__MACOSX/
+.local-archive/
+.env
+conf/*.env
+!conf/config.example.env
+.venv/
+__pycache__/
+*.pyc
+*.log
+.demo-runs/
+data/
+output/
+spark-warehouse/
+metastore_db/
+derby.log

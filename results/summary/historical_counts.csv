@@ -1,0 +1,6 @@
+metric_type,clean_records,v1_anomaly_points,v2_anomaly_points,v3_anomaly_points,v4_anomaly_events
+container,22211676,238853,40554,108723,27172
+istio,13695910,167447,64184,84068,44784
+jvm,5750910,85374,12710,6876,153
+node,2933643,73792,11144,21260,1743
+service,380008,9407,636,3585,106
